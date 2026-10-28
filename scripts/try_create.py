@@ -8,11 +8,23 @@ import urllib.request
 
 import oci
 
-SHAPE = 'VM.Standard.A1.Flex'
-NAME = 'oci-free-arm'
+ARM = 'VM.Standard.A1.Flex'
+AMD = 'VM.Standard.E2.1.Micro'
+# One request per run: retain ARM attempts and use alternate runs for a small free proxy VM.
+SHAPE = AMD if int(os.environ.get('GITHUB_RUN_NUMBER', '1')) % 2 == 0 else ARM
+AMD_PLATFORM_IMAGE = 'ocid1.image.oc1.us-sanjose-1.aaaaaaaaputbo24b2twomwo6y3kxdo4ygjnoan26wixtbfuv7galmhwdy42a'
+NAME = 'oci-free-proxy'
 MARKER = 'oci-free-arm-instance'
 RETRY_MARKER = 'Safe to retry: capacity unavailable'
 REQUEST_STEP = 'Request one instance'
+
+
+def boot_size():
+    return 100 if SHAPE == ARM else 50
+
+
+def image_id():
+    return os.environ['IMAGE_ID'] if SHAPE == ARM else AMD_PLATFORM_IMAGE
 
 
 def output(**values):
@@ -96,10 +108,10 @@ def check():
     used_gb = 0
     for compartment in compartments:
         instances = all_items(compute.list_instances, compartment)
-        arm = [i for i in instances if i.shape == SHAPE and i.lifecycle_state != 'TERMINATED']
-        if arm:
-            managed = [i for i in arm if i.freeform_tags.get('managed-by') == MARKER]
-            summary('EXISTING: A1 instance already exists. No new instance will be created.'
+        servers = [i for i in instances if i.shape in (ARM, AMD) and i.lifecycle_state != 'TERMINATED']
+        if servers:
+            managed = [i for i in servers if i.freeform_tags.get('managed-by') == MARKER]
+            summary('EXISTING: A free ARM or AMD instance already exists. No new instance will be created.'
                     + (' This workflow created it.' if managed else ' Review it in the OCI console.'))
             output(status='existing')
             return
@@ -110,19 +122,19 @@ def check():
         used_gb += sum(v.size_in_gbs for v in all_items(
             block.list_volumes, compartment_id=compartment)
             if v.lifecycle_state != 'TERMINATED')
-    if used_gb + 100 > 200:
-        raise ValueError('Adding 100 GB would exceed the 200 GB free storage allowance.')
+    if used_gb + boot_size() > 200:
+        raise ValueError('Adding this boot volume would exceed the 200 GB free storage allowance.')
     subnet = network.get_subnet(os.environ['OCI_SUBNET_ID']).data
     if subnet.prohibit_public_ip_on_vnic or subnet.lifecycle_state != 'AVAILABLE':
         raise ValueError('Subnet is not an available public subnet.')
-    image = compute.get_image(os.environ['IMAGE_ID']).data
+    image = compute.get_image(image_id()).data
     if image.operating_system != 'Canonical Ubuntu' or image.operating_system_version != '24.04':
         raise ValueError('Only Canonical Ubuntu 24.04 is allowed.')
     if image.compartment_id or image.launch_mode == 'EMULATED':
         raise ValueError('Only an Oracle platform image is allowed.')
     compatible = all_items(compute.list_image_shape_compatibility_entries, image.id)
     if SHAPE not in [entry.shape for entry in compatible]:
-        raise ValueError('Image is not compatible with the A1 ARM shape.')
+        raise ValueError('Image is not compatible with the selected free shape.')
     repo = os.environ.get('GITHUB_REPOSITORY')
     if repo:
         runs = github(f'repos/{repo}/actions/workflows/create-vm.yml/runs?per_page=100')['workflow_runs']
@@ -132,7 +144,8 @@ def check():
             summary('BLOCKED: A previous request may have been accepted. Stopping for manual review; no new request sent.')
             output(status='blocked')
             return
-    summary('Preflight passed: home region, no existing A1, public subnet, Ubuntu ARM image, storage within 200 GB. Target: 2 OCPU / 12 GB RAM / 100 GB boot volume.')
+    target = 'ARM 2 OCPU / 12 GB RAM / 100 GB boot volume' if SHAPE == ARM else 'AMD E2.1.Micro / 1 GB RAM / 50 GB boot volume'
+    summary('Preflight passed: home region, no existing ARM/AMD server, public subnet, compatible official Ubuntu image, storage within 200 GB. Target: ' + target + '.')
     output(status='ready')
 
 
@@ -140,14 +153,14 @@ def launch():
     config = load_config()
     compute = oci.core.ComputeClient(config, retry_strategy=oci.retry.NoneRetryStrategy(), timeout=(15, 90))
     # Stable per repository. Never use automatic launch retries after uncertain transport errors.
-    token = hashlib.sha256(('oci-free-arm-v1:' + os.environ['GITHUB_REPOSITORY']).encode()).hexdigest()
+    token = hashlib.sha256(('oci-free-proxy-v1:' + os.environ['GITHUB_REPOSITORY'] + ':' + SHAPE).encode()).hexdigest()
     details = oci.core.models.LaunchInstanceDetails(
         compartment_id=os.environ['OCI_COMPARTMENT_ID'],
         availability_domain=os.environ['AD_NAME'],
         display_name=NAME, shape=SHAPE,
-        shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=2, memory_in_gbs=12),
+        shape_config=(oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=2, memory_in_gbs=12) if SHAPE == ARM else None),
         source_details=oci.core.models.InstanceSourceViaImageDetails(
-            image_id=os.environ['IMAGE_ID'], boot_volume_size_in_gbs=100, boot_volume_vpus_per_gb=10),
+            image_id=image_id(), boot_volume_size_in_gbs=boot_size(), boot_volume_vpus_per_gb=10),
         create_vnic_details=oci.core.models.CreateVnicDetails(
             subnet_id=os.environ['OCI_SUBNET_ID'], assign_public_ip=True),
         metadata={'ssh_authorized_keys': os.environ['SSH_PUBLIC_KEY']},
