@@ -10,21 +10,23 @@ import oci
 
 ARM = 'VM.Standard.A1.Flex'
 AMD = 'VM.Standard.E2.1.Micro'
-# One request per run: retain ARM attempts and use alternate runs for a small free proxy VM.
-SHAPE = AMD if int(os.environ.get('GITHUB_RUN_NUMBER', '1')) % 2 == 0 else ARM
-AMD_PLATFORM_IMAGE = 'ocid1.image.oc1.us-sanjose-1.aaaaaaaaputbo24b2twomwo6y3kxdo4ygjnoan26wixtbfuv7galmhwdy42a'
-NAME = 'oci-free-proxy'
+SHAPE = ARM
+NAME = 'oci-free-arm'
+# This exact AMD success was audited (RUNNING + SSH) before the user asked
+# to continue for ARM. It is not an unresolved ARM request.
+REVIEWED_AMD_RUN = '40663927323'
+REVIEWED_AMD_HEAD = '4f2f67e09615fa0c8726bbc80fd7b9e5257faaa0'
 MARKER = 'oci-free-arm-instance'
 RETRY_MARKER = 'Safe to retry: capacity unavailable'
 REQUEST_STEP = 'Request one instance'
 
 
 def boot_size():
-    return 100 if SHAPE == ARM else 50
+    return 100
 
 
 def image_id():
-    return os.environ['IMAGE_ID'] if SHAPE == ARM else AMD_PLATFORM_IMAGE
+    return os.environ['IMAGE_ID']
 
 
 def output(**values):
@@ -62,6 +64,10 @@ def previous_run_safe(runs, jobs, current_run):
     latest = max(previous, key=lambda r: r.get('run_started_at') or r['created_at'])
     if latest['status'] != 'completed':
         return False
+    if (str(latest['id']) == REVIEWED_AMD_RUN
+            and latest.get('head_sha') == REVIEWED_AMD_HEAD
+            and latest.get('conclusion') == 'success'):
+        return True
     steps = [s for job in jobs(latest['id']) for s in job.get('steps', [])]
     requests = [s for s in steps if s['name'] == REQUEST_STEP]
     if not requests or all(s.get('conclusion') == 'skipped' for s in requests):
@@ -108,10 +114,10 @@ def check():
     used_gb = 0
     for compartment in compartments:
         instances = all_items(compute.list_instances, compartment)
-        servers = [i for i in instances if i.shape in (ARM, AMD) and i.lifecycle_state != 'TERMINATED']
+        servers = [i for i in instances if i.shape == ARM and i.lifecycle_state != 'TERMINATED']
         if servers:
             managed = [i for i in servers if i.freeform_tags.get('managed-by') == MARKER]
-            summary('EXISTING: A free ARM or AMD instance already exists. No new instance will be created.'
+            summary('EXISTING: An ARM instance already exists. No new ARM instance will be created.'
                     + (' This workflow created it.' if managed else ' Review it in the OCI console.'))
             output(status='existing')
             return
@@ -144,8 +150,7 @@ def check():
             summary('BLOCKED: A previous request may have been accepted. Stopping for manual review; no new request sent.')
             output(status='blocked')
             return
-    target = 'ARM 2 OCPU / 12 GB RAM / 100 GB boot volume' if SHAPE == ARM else 'AMD E2.1.Micro / 1 GB RAM / 50 GB boot volume'
-    summary('Preflight passed: home region, no existing ARM/AMD server, public subnet, compatible official Ubuntu image, storage within 200 GB. Target: ' + target + '.')
+    summary('Preflight passed: home region, no existing ARM server, public subnet, compatible official Ubuntu image, storage within 200 GB. Target: ARM 2 OCPU / 12 GB RAM / 100 GB boot volume. Existing AMD is retained.')
     output(status='ready')
 
 
@@ -158,7 +163,7 @@ def launch():
         compartment_id=os.environ['OCI_COMPARTMENT_ID'],
         availability_domain=os.environ['AD_NAME'],
         display_name=NAME, shape=SHAPE,
-        shape_config=(oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=2, memory_in_gbs=12) if SHAPE == ARM else None),
+        shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=2, memory_in_gbs=12),
         source_details=oci.core.models.InstanceSourceViaImageDetails(
             image_id=image_id(), boot_volume_size_in_gbs=boot_size(), boot_volume_vpus_per_gb=10),
         create_vnic_details=oci.core.models.CreateVnicDetails(

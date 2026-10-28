@@ -12,23 +12,59 @@ spec.loader.exec_module(module)
 
 
 class SafetyTest(unittest.TestCase):
-    @patch.dict(os.environ, {'OCI_COMPARTMENT_ID':'root','AD_NAME':'ad'})
-    def test_either_free_shape_stops_other_shape_from_creating_a_second_vm(self):
+    @patch.dict(os.environ, {'OCI_COMPARTMENT_ID':'root','AD_NAME':'ad',
+                            'OCI_SUBNET_ID':'subnet','IMAGE_ID':'arm-image',
+                            'GITHUB_REPOSITORY':''})
+    def check_account(self, existing_shape, disk_gb=50):
         identity=NS(
             list_region_subscriptions=lambda _: NS(data=[NS(is_home_region=True,region_name='us-sanjose-1')]),
             list_availability_domains=lambda _: NS(data=[NS(name='ad')]),
             list_compartments=object())
-        compute=NS(list_instances=object())
-        for target,existing in [(module.ARM,module.AMD),(module.AMD,module.ARM)]:
-            server=NS(shape=existing,lifecycle_state='RUNNING',freeform_tags={})
-            with patch.object(module,'SHAPE',target), \
-                 patch.object(module,'load_config',return_value={'tenancy':'root','region':'us-sanjose-1'}), \
-                 patch.object(module,'clients',return_value=(identity,compute,NS(),NS())), \
-                 patch.object(module,'all_items',side_effect=[[],[server]]) as listing, \
-                 patch.object(module,'output') as output:
-                module.check()
-                output.assert_called_once_with(status='existing')
-                self.assertEqual(listing.call_count,2)
+        compute=NS(list_instances=object(),list_image_shape_compatibility_entries=object(),
+                   get_image=lambda _:NS(data=NS(id='arm-image',operating_system='Canonical Ubuntu',
+                       operating_system_version='24.04',compartment_id=None,launch_mode='NATIVE')))
+        network=NS(get_subnet=lambda _:NS(data=NS(prohibit_public_ip_on_vnic=False,lifecycle_state='AVAILABLE')))
+        block=NS(list_boot_volumes=object(),list_volumes=object())
+        server=NS(shape=existing_shape,lifecycle_state='RUNNING',freeform_tags={})
+        def listing(method,*args,**kwargs):
+            if method is identity.list_compartments: return []
+            if method is compute.list_instances: return [server]
+            if method is block.list_boot_volumes: return [NS(size_in_gbs=disk_gb,lifecycle_state='AVAILABLE')]
+            if method is block.list_volumes: return []
+            if method is compute.list_image_shape_compatibility_entries: return [NS(shape=module.ARM)]
+            raise AssertionError('Unexpected account read')
+        with patch.object(module,'load_config',return_value={'tenancy':'root','region':'us-sanjose-1'}), \
+             patch.object(module,'clients',return_value=(identity,compute,network,block)), \
+             patch.object(module,'all_items',side_effect=listing), \
+             patch.object(module,'output') as output:
+            module.check()
+            return output.call_args.kwargs['status']
+
+    def test_existing_amd_allows_original_arm_target(self):
+        self.assertEqual(self.check_account(module.AMD),'ready')
+
+    def test_existing_arm_stops_second_arm(self):
+        self.assertEqual(self.check_account(module.ARM),'existing')
+
+    def test_amd_storage_still_counts_toward_free_allowance(self):
+        with self.assertRaisesRegex(ValueError,'200 GB'):
+            self.check_account(module.AMD,disk_gb=101)
+
+    def test_only_arm_is_selected_even_for_even_run(self):
+        with patch.dict(os.environ,{'GITHUB_RUN_NUMBER':'30'}):
+            fresh=importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fresh)
+            self.assertEqual(fresh.SHAPE,module.ARM)
+
+    def test_exact_audited_amd_success_allows_new_arm_goal(self):
+        run={'id':int(module.REVIEWED_AMD_RUN),'status':'completed',
+             'created_at':'2026-10-28T09:24:00Z','head_sha':module.REVIEWED_AMD_HEAD,
+             'conclusion':'success'}
+        jobs=lambda _:[{'steps':[{'name':module.REQUEST_STEP,'conclusion':'success'}]}]
+        self.assertTrue(module.previous_run_safe([run],jobs,999))
+        for changes in [{'id':123},{'head_sha':'unexpected'},{'conclusion':'failure'},
+                        {'status':'in_progress'}]:
+            self.assertFalse(module.previous_run_safe([dict(run,**changes)],jobs,999))
 
     def history(self, status='completed'):
         return [{'id': 1, 'status': status, 'created_at': '2026-10-24T00:00:00Z'}]
@@ -98,25 +134,6 @@ class SafetyTest(unittest.TestCase):
                 output.assert_called_once_with(status=expected)
                 self.assertEqual(client.return_value.launch_instance.call_count,1)
 
-    @patch.object(module, 'SHAPE', 'VM.Standard.E2.1.Micro')
-    @patch.dict(os.environ, {'OCI_COMPARTMENT_ID':'root', 'AD_NAME':'ad', 'IMAGE_ID':'arm-image',
-                            'OCI_SUBNET_ID':'subnet', 'SSH_PUBLIC_KEY':'ssh-rsa public',
-                            'GITHUB_REPOSITORY':'owner/repo'})
-    def test_amd_uses_fixed_free_shape_and_x86_platform_image(self):
-        with patch.object(module,'load_config',return_value={}), \
-             patch.object(module.oci.core,'ComputeClient') as client, \
-             patch.object(module,'output') as output:
-            client.return_value.launch_instance.return_value=NS(data=NS(lifecycle_state='PROVISIONING'))
-            module.launch()
-            self.assertEqual(client.return_value.launch_instance.call_count,1)
-            details=client.return_value.launch_instance.call_args.args[0]
-            self.assertEqual(details.shape,'VM.Standard.E2.1.Micro')
-            self.assertIsNone(details.shape_config)
-            self.assertEqual(details.source_details.image_id,module.AMD_PLATFORM_IMAGE)
-            self.assertNotEqual(details.source_details.image_id,'arm-image')
-            self.assertEqual(details.source_details.boot_volume_size_in_gbs,50)
-            self.assertEqual(details.source_details.boot_volume_vpus_per_gb,10)
-            output.assert_called_once_with(status='accepted')
 
 
 if __name__ == '__main__':
