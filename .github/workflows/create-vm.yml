@@ -2,7 +2,7 @@ name: Try to Create OCI VM
 
 on:
   schedule:
-    - cron: '9,19,29,39,49,59 * * * *'
+    - cron: '6,16,26,36,46,56 * * * *'
   workflow_dispatch:
 
 permissions:
